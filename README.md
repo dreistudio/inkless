@@ -4,7 +4,7 @@ A wireless thermal receipt printer powered by an ESP32 and a QR204 58mm thermal 
 
 Built for [Strebergarten](https://strebergarten.studio), our innovation studio. The AI modes are garden-themed because that's us. Yours will be different and uniquely yours. You won't get around cringey puns in this project...
 
-**[Read the full build story →](https://strebergarten.studio/Inkless-Possibilities)**
+**[Read the full build story →](https://strebergarten.studio/How-a-cheap-receipt-printer-can-print-kindness-and-tell-you-which-plant-you-are)**
 
 ## What it does
 
