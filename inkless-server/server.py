@@ -13,9 +13,10 @@ import anthropic
 import httpx
 import uvicorn
 from dotenv import load_dotenv
+from collections import deque
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -24,6 +25,112 @@ log = logging.getLogger("inkless-server")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 PRINTER_URL = os.environ.get("PRINTER_URL", "http://printer.local")
+
+# In-memory log of recent prints (newest first, capped at 50)
+recent_prints: deque = deque(maxlen=50)
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inkless</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: monospace; background: #f5f5f0; color: #111; padding: 2rem; max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.2rem; margin-bottom: 0.25rem; }
+  .sub { color: #777; font-size: 0.85rem; margin-bottom: 2rem; }
+  .status { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; margin-bottom: 2rem; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #4caf50; }
+  .dot.err { background: #f44336; }
+  section { margin-bottom: 2rem; }
+  h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.08em; color: #777; margin-bottom: 0.75rem; }
+  textarea { width: 100%; height: 120px; font-family: monospace; font-size: 0.9rem; padding: 0.75rem; border: 1px solid #ccc; border-radius: 4px; resize: vertical; background: #fff; }
+  .row { display: flex; gap: 1rem; align-items: center; margin-top: 0.5rem; }
+  label { font-size: 0.85rem; display: flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+  button { padding: 0.5rem 1.25rem; font-family: monospace; font-size: 0.9rem; background: #111; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #333; }
+  .msg { font-size: 0.85rem; margin-top: 0.5rem; min-height: 1.2em; }
+  .msg.ok { color: #4caf50; }
+  .msg.err { color: #f44336; }
+  .log { list-style: none; }
+  .log li { display: flex; gap: 1rem; padding: 0.5rem 0; border-bottom: 1px solid #e5e5e0; font-size: 0.85rem; }
+  .log .time { color: #999; flex-shrink: 0; }
+  .log .text { flex: 1; white-space: pre-wrap; word-break: break-word; }
+  .log .badge { flex-shrink: 0; font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 3px; align-self: flex-start; }
+  .badge.printed { background: #e8f5e9; color: #2e7d32; }
+  .badge.error { background: #ffebee; color: #c62828; }
+  .empty { color: #aaa; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>inkless</h1>
+<p class="sub">strebergarten.studio</p>
+
+<div class="status" id="statusLine">
+  <span class="dot" id="statusDot"></span>
+  <span id="statusText">checking…</span>
+</div>
+
+<section>
+  <h2>Print</h2>
+  <textarea id="printText" placeholder="Type your receipt text here…"></textarea>
+  <div class="row">
+    <label><input type="checkbox" id="logo"> logo</label>
+    <button onclick="sendPrint()">Print</button>
+  </div>
+  <p class="msg" id="printMsg"></p>
+</section>
+
+<section>
+  <h2>Recent prints</h2>
+  <ul class="log" id="log"><li class="empty">No prints yet this session.</li></ul>
+</section>
+
+<script>
+async function checkStatus() {
+  try {
+    const r = await fetch('/status');
+    const d = await r.json();
+    document.getElementById('statusDot').className = 'dot';
+    document.getElementById('statusText').textContent = 'online — printer: ' + d.printer_url;
+  } catch {
+    document.getElementById('statusDot').className = 'dot err';
+    document.getElementById('statusText').textContent = 'offline';
+  }
+}
+
+async function loadLog() {
+  try {
+    const r = await fetch('/api/recent');
+    const items = await r.json();
+    const ul = document.getElementById('log');
+    if (!items.length) { ul.innerHTML = '<li class="empty">No prints yet this session.</li>'; return; }
+    ul.innerHTML = items.map(i =>
+      `<li><span class="time">${i.time}</span><span class="text">${i.text}</span><span class="badge ${i.status}">${i.status}</span></li>`
+    ).join('');
+  } catch {}
+}
+
+async function sendPrint() {
+  const text = document.getElementById('printText').value.trim();
+  const logo = document.getElementById('logo').checked;
+  const msg = document.getElementById('printMsg');
+  if (!text) { msg.textContent = 'Enter some text first.'; msg.className = 'msg err'; return; }
+  msg.textContent = 'Printing…'; msg.className = 'msg';
+  try {
+    const r = await fetch('/api/print', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text, logo}) });
+    if (r.ok) { msg.textContent = 'Printed.'; msg.className = 'msg ok'; loadLog(); }
+    else { const d = await r.json(); msg.textContent = 'Error: ' + (d.error?.message || r.status); msg.className = 'msg err'; loadLog(); }
+  } catch(e) { msg.textContent = 'Network error.'; msg.className = 'msg err'; }
+}
+
+checkStatus();
+loadLog();
+setInterval(loadLog, 5000);
+</script>
+</body>
+</html>"""
 
 # Reusable async client (connection pooling across requests)
 ai_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -47,6 +154,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+
+@app.get("/api/recent")
+async def get_recent():
+    return list(recent_prints)
 
 
 @app.get("/status")
@@ -187,7 +304,11 @@ async def print_receipt(req: PrintRequest):
             await print_qrcode(req.qr)
     except httpx.HTTPError as e:
         log.exception("Printer communication error")
-        return JSONResponse(status_code=502, content={"error": {"message": f"Printer unavailable: {e}"}})
+        entry = {"time": datetime.now().strftime("%H:%M"), "text": req.text, "status": "error"}
+        recent_prints.appendleft(entry)
+        return JSONResponse(status_code=502, content={"error": {"message": f"Printer unavailable: {e}"}, "text": req.text})
+    entry = {"time": datetime.now().strftime("%H:%M"), "text": req.text, "status": "printed"}
+    recent_prints.appendleft(entry)
     return {"status": "printed"}
 
 
