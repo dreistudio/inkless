@@ -1,13 +1,17 @@
-"""inkless-server: AI proxy for the Inkless receipt printer."""
+"""inkless-server: AI proxy for the Inkless receipt printer.
+
+Every slip leaves through the inkless gateway (the same door the `inkless` command and the
+robot use), so its caps, hold switch and log apply to the AI modes too. This server never
+calls the printer's own LAN API. It holds the Anthropic key; the gateway holds none.
+"""
 
 import json
 import logging
 import os
-import re
-import unicodedata
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional, Union
 
 import anthropic
 import httpx
@@ -24,10 +28,45 @@ load_dotenv()
 log = logging.getLogger("inkless-server")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-PRINTER_URL = os.environ.get("PRINTER_URL", "http://printer.local")
+GATEWAY_URL = os.environ.get("INKLESS_GATEWAY_URL", "http://127.0.0.1:8110").rstrip("/")
+GATEWAY_TOKEN = os.environ.get("INKLESS_TOKEN", "").strip()
+GATEWAY_HEADERS = {"Authorization": f"Bearer {GATEWAY_TOKEN}", "X-Inkless-From": "inkless-server"}
+SERVER_PORT = int(os.environ.get("INKLESS_SERVER_PORT", "8100"))
 
 # In-memory log of recent prints (newest first, capped at 50)
 recent_prints: deque = deque(maxlen=50)
+
+# /api/generate is called from visitors' browsers, so it must not be a general-purpose
+# door to the API key: only the models the web UI uses, with its output ceilings, its one
+# tool, a bounded request size, and a bounded number of calls per hour.
+GENERATE_MODELS = {"claude-haiku-4-5-20251001": 500, "claude-sonnet-4-6": 1024}  # model → max_tokens ceiling
+GENERATE_MAX_BODY = 20_000  # bytes
+GENERATE_MAX_SEARCHES = 3
+GENERATE_PER_HOUR = int(os.environ.get("GENERATE_PER_HOUR", "60"))
+generate_calls: deque = deque()
+
+
+def generate_refusal(raw: bytes, body: dict) -> Optional[JSONResponse]:
+    """Why this request is not served, or None if it is within what the web UI does."""
+    def refuse(code, message):
+        return JSONResponse(status_code=code, content={"error": {"message": message}})
+    if len(raw) > GENERATE_MAX_BODY:
+        return refuse(413, "Request too large")
+    if body.get("model", "claude-haiku-4-5-20251001") not in GENERATE_MODELS:
+        return refuse(400, "Model not allowed")
+    if not isinstance(body.get("max_tokens", 500), int):
+        return refuse(400, "max_tokens must be a number")
+    for tool in body.get("tools") or []:
+        uses = tool.get("max_uses") if isinstance(tool, dict) else None
+        if not (isinstance(uses, int) and uses <= GENERATE_MAX_SEARCHES
+                and str(tool.get("type", "")).startswith("web_search_")):
+            return refuse(400, "Tool not allowed")
+    while generate_calls and time.time() - generate_calls[0] > 3600:
+        generate_calls.popleft()
+    if len(generate_calls) >= GENERATE_PER_HOUR:
+        return refuse(429, "Too many requests this hour")
+    generate_calls.append(time.time())
+    return None
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -93,7 +132,8 @@ async function checkStatus() {
     const r = await fetch('/status');
     const d = await r.json();
     document.getElementById('statusDot').className = 'dot';
-    document.getElementById('statusText').textContent = 'online — printer: ' + d.printer_url;
+    document.getElementById('statusDot').className = d.printer === 'online' ? 'dot' : 'dot err';
+    document.getElementById('statusText').textContent = 'online — gateway ' + d.gateway + ' — printer ' + d.printer + (d.hold ? ' — ON HOLD' : '');
   } catch {
     document.getElementById('statusDot').className = 'dot err';
     document.getElementById('statusText').textContent = 'offline';
@@ -106,8 +146,9 @@ async function loadLog() {
     const items = await r.json();
     const ul = document.getElementById('log');
     if (!items.length) { ul.innerHTML = '<li class="empty">No prints yet this session.</li>'; return; }
+    const esc = t => String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     ul.innerHTML = items.map(i =>
-      `<li><span class="time">${i.time}</span><span class="text">${i.text}</span><span class="badge ${i.status}">${i.status}</span></li>`
+      `<li><span class="time">${esc(i.time)}</span><span class="text">${esc(i.text)}</span><span class="badge ${esc(i.status)}">${esc(i.status)}</span></li>`
     ).join('');
   } catch {}
 }
@@ -140,8 +181,10 @@ ai_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API
 async def lifespan(app: FastAPI):
     if not ANTHROPIC_API_KEY:
         log.warning("ANTHROPIC_API_KEY not set")
-    log.info("Printer: %s", PRINTER_URL)
-    log.info("Ready on http://localhost:8100")
+    if not GATEWAY_TOKEN:
+        log.warning("INKLESS_TOKEN not set - nothing will print")
+    log.info("Gateway: %s", GATEWAY_URL)
+    log.info("Ready on port %d", SERVER_PORT)
     yield
 
 
@@ -166,13 +209,37 @@ async def get_recent():
     return list(recent_prints)
 
 
+async def gateway_status() -> dict:
+    """What the gateway says about itself and the printer; 'unreachable' if it does not answer."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{GATEWAY_URL}/v1/status", headers=GATEWAY_HEADERS, timeout=15.0)
+            r.raise_for_status()
+            return r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        return {"gateway": "unreachable", "printer": "unknown", "error": type(e).__name__}
+
+
 @app.get("/status")
 async def status():
+    g = await gateway_status()
     return {
         "status": "online",
-        "printer_url": PRINTER_URL,
+        "gateway": g.get("gateway", "unreachable"),
+        "printer": g.get("printer", "unknown"),
+        "hold": g.get("hold", False),
+        "slips_left_this_hour": g.get("slips_left_this_hour"),
         "api_key_set": bool(ANTHROPIC_API_KEY),
     }
+
+
+@app.get("/api/printer")
+async def printer_status():
+    """Is the printer reachable, as seen by the gateway? Tells 'server down' from 'printer unplugged'."""
+    g = await gateway_status()
+    if g.get("printer") == "online":
+        return {"status": "online"}
+    return JSONResponse(status_code=502, content={"error": {"message": f"Printer unavailable: gateway {g.get('gateway')}, printer {g.get('printer')}"}})
 
 
 @app.post("/api/generate")
@@ -184,16 +251,22 @@ async def generate(request: Request):
             content={"error": {"message": "ANTHROPIC_API_KEY not configured"}},
         )
 
+    raw = await request.body()
     try:
-        body = await request.json()
+        body = json.loads(raw)
+        assert isinstance(body, dict)
     except Exception:
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "Invalid JSON body"}},
         )
 
+    refusal = generate_refusal(raw, body)
+    if refusal:
+        return refusal
+
     model = body.get("model", "claude-haiku-4-5-20251001")
-    max_tokens = body.get("max_tokens", 500)
+    max_tokens = min(int(body.get("max_tokens", 500)), GENERATE_MODELS[model])
     system = body.get("system", "")
     messages = body.get("messages", [])
     stream = body.get("stream", False)
@@ -239,76 +312,64 @@ async def generate(request: Request):
             return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
 
 
-# --- Printer helpers ---
+# --- Printing: one slip = one gateway call ---
 
-def sanitize(text: str) -> str:
-    """Replace Unicode characters with ASCII equivalents for the thermal printer."""
-    # Smart quotes
-    text = re.sub(r'[\u2018\u2019\u201A\u2032]', "'", text)
-    text = re.sub(r'[\u201C\u201D\u201E\u2033]', '"', text)
-    # Dashes
-    text = re.sub(r'[\u2013\u2014]', '-', text)
-    # Ellipsis
-    text = text.replace('\u2026', '...')
-    # Spaces
-    text = re.sub(r'[\u00A0\u2002\u2003\u2009]', ' ', text)
-    # Bullets
-    text = text.replace('\u2022', '-')
-    # Strip accents: é→e, ü→u, etc.
-    nfkd = unicodedata.normalize('NFKD', text)
-    text = ''.join(c for c in nfkd if not unicodedata.combining(c))
-    # Drop any remaining non-ASCII
-    text = re.sub(r'[^\x00-\x7F]', '', text)
-    return text
+class GatewayRefused(Exception):
+    """The gateway answered, but said no (hold, hourly cap, too long, bad token)."""
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
 
 
-async def print_text(text: str):
-    """Send sanitized text to the printer via its HTTP API."""
+async def print_slip(text: str, logo: Optional[str] = None, qr: Optional[str] = None) -> dict:
+    """One slip through the gateway. It shapes the text for the paper, applies the caps and logs; raises on refusal or printer trouble."""
+    body = {"text": text}
+    if logo:
+        body["logo"] = logo
+    if qr:
+        body["qr"] = qr
     async with httpx.AsyncClient() as client:
-        r = await client.post(f"{PRINTER_URL}/print/text", json={"text": sanitize(text)}, timeout=10.0)
-        r.raise_for_status()
+        r = await client.post(f"{GATEWAY_URL}/v1/print", json=body, headers=GATEWAY_HEADERS, timeout=90.0)
+    if r.status_code == 200:
+        return r.json()
+    try:
+        j = r.json()
+        detail = j.get("detail") or (j.get("error") or {}).get("message") or r.text
+    except ValueError:
+        detail = r.text
+    if r.status_code == 502:
+        raise httpx.HTTPError(f"printer unreachable ({detail})")
+    raise GatewayRefused(r.status_code, str(detail))
 
 
-async def print_logo():
-    """Print the logo on the printer."""
-    async with httpx.AsyncClient() as client:
-        r = await client.post(f"{PRINTER_URL}/print/logo/raster", timeout=30.0)
-        r.raise_for_status()
+def _record(text: str, status: str):
+    recent_prints.appendleft({"time": datetime.now().strftime("%H:%M"), "text": text, "status": status})
 
 
-async def print_qrcode(data: str, size: int = 4):
-    """Print a QR code on the printer."""
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{PRINTER_URL}/print/qrcode",
-            json={"data": data, "size": size},
-            timeout=10.0,
-        )
-        r.raise_for_status()
+def _print_error(e: Exception, text: str) -> JSONResponse:
+    _record(text, "error")
+    if isinstance(e, GatewayRefused):
+        log.warning("Gateway refused: %s %s", e.status, e)
+        return JSONResponse(status_code=e.status, content={"error": {"message": f"Gateway refused: {e}"}, "text": text})
+    log.exception("Gateway/printer communication error")
+    return JSONResponse(status_code=502, content={"error": {"message": f"Printer unavailable: {e}"}, "text": text})
 
 
 class PrintRequest(BaseModel):
     text: str
-    logo: bool = False
+    logo: Union[Literal["drei", "strebergarten"], bool, None] = None  # true = strebergarten
     qr: Optional[str] = None
 
 
 @app.post("/api/print")
 async def print_receipt(req: PrintRequest):
-    """Print text (with optional logo and QR). Designed for iOS Shortcuts / automations."""
+    """Print text (with optional logo and QR) through the gateway. Used by the printer's web UI and automations."""
+    logo = "strebergarten" if req.logo is True else (req.logo or None)
     try:
-        if req.logo:
-            await print_logo()
-        await print_text(req.text)
-        if req.qr:
-            await print_qrcode(req.qr)
-    except httpx.HTTPError as e:
-        log.exception("Printer communication error")
-        entry = {"time": datetime.now().strftime("%H:%M"), "text": req.text, "status": "error"}
-        recent_prints.appendleft(entry)
-        return JSONResponse(status_code=502, content={"error": {"message": f"Printer unavailable: {e}"}, "text": req.text})
-    entry = {"time": datetime.now().strftime("%H:%M"), "text": req.text, "status": "printed"}
-    recent_prints.appendleft(entry)
+        await print_slip(req.text, logo=logo, qr=req.qr)
+    except (httpx.HTTPError, GatewayRefused) as e:
+        return _print_error(e, req.text)
+    _record(req.text, "printed")
     return {"status": "printed"}
 
 
@@ -386,23 +447,17 @@ async def print_dayend(req: DayEndRequest):
 
     if not req.debug:
         try:
-            await print_logo()
-            await print_text(full_receipt)
-            async with httpx.AsyncClient() as client:
-                await client.post(f"{PRINTER_URL}/feed", data={"lines": "6"}, timeout=10.0)
-        except httpx.HTTPError as e:
-            log.exception("Printer communication error")
-            return JSONResponse(
-                status_code=502,
-                content={"error": {"message": f"Printer unavailable: {e}"}, "text": full_receipt},
-            )
+            await print_slip(full_receipt, logo="strebergarten")
+        except (httpx.HTTPError, GatewayRefused) as e:
+            return _print_error(e, full_receipt)
+        _record(full_receipt, "printed")
 
     return {"status": "printed", "text": full_receipt}
 
 
 def main():
     reload = os.environ.get("INKLESS_DEV", "").lower() in ("1", "true")
-    uvicorn.run("server:app", host="0.0.0.0", port=8100, reload=reload)
+    uvicorn.run("server:app", host="0.0.0.0", port=SERVER_PORT, reload=reload)
 
 
 if __name__ == "__main__":

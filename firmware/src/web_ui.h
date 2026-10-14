@@ -69,6 +69,7 @@ const char WEB_UI_HTML[] PROGMEM = R"rawliteral(
   <div class="bg-white rounded-2xl shadow-lg p-6">
 
     <div id="status" class="mb-4 text-center text-sm text-gray-500 hidden"></div>
+    <div id="serverBadge" class="mb-2 text-center text-xs text-gray-400">checking printer...</div>
 
     <div style="min-height: 280px;">
 
@@ -387,19 +388,27 @@ function sanitize(text) {
     .replace(/[^\x00-\x7F]/g, '');
 }
 
-async function printOrPreview(text) {
+// Every slip goes through inkless-server -> the gateway (caps, hold, log), never straight to
+// the printer. logo: true prints the Strebergarten logo above the text; qr: a link below it.
+async function printOrPreview(text, logo, qr) {
   if (isDebug()) {
     showPreview(text);
     showStatus('Preview (not printed)', 'text-amber-600');
     return true;
   }
-  const res = await fetch('/print/text', {
+  const res = await fetch(getServerUrl() + '/api/print', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: sanitize(text) })
+    body: JSON.stringify({ text: sanitize(text), logo: logo ? 'strebergarten' : null, qr: qr || null })
   });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    lastPrintError = err.error?.message || ('print failed ' + res.status);
+  }
   return res.ok;
 }
+let lastPrintError = '';
+function printFailed() { showStatus('Print failed: ' + (lastPrintError || 'unknown'), 'text-red-500'); }
 
 // --- History (localStorage) ---
 function getHistory() {
@@ -468,13 +477,8 @@ async function reprintHistory(index) {
   if (!history[index]) return;
   const text = history[index].output;
   try {
-    const res = await fetch('/print/text', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text: sanitize(text)})
-    });
-    if (res.ok) showStatus('Reprinted!', 'text-green-600');
-    else showStatus('Reprint failed', 'text-red-500');
+    if (await printOrPreview(text, true)) showStatus('Reprinted!', 'text-green-600');
+    else showStatus('Reprint failed: ' + lastPrintError, 'text-red-500');
   } catch (err) { showStatus('Reprint failed: ' + err.message, 'text-red-500'); }
 }
 
@@ -495,17 +499,32 @@ function exportHistory() {
   URL.revokeObjectURL(url);
 }
 
-// --- Logo ---
-async function printLogo() {
-  try {
-    await fetch('/print/logo/raster', {method: 'POST'});
-  } catch (e) { /* skip logo if unavailable */ }
+// --- inkless-server (AI + printing, on the studio Pi) ---
+// The firmware hands us a hostname (.local) and an IP fallback: phones that cannot resolve
+// mDNS use the IP. Whichever answers /status first is used for the rest of the visit.
+let serverUrl = null;
+async function probeServer() {
+  const candidates = [window.INKLESS_SERVER, window.INKLESS_SERVER_FALLBACK].filter(Boolean);
+  for (const url of candidates) {
+    try {
+      const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 4000);
+      const r = await fetch(url + '/status', {signal: ctrl.signal}); clearTimeout(t);
+      if (r.ok) { serverUrl = url; const d = await r.json().catch(() => ({})); updateServerBadge(d); return; }
+    } catch (e) { /* try the next */ }
+  }
+  updateServerBadge(null);
 }
-
-// --- inkless-server AI proxy ---
+function updateServerBadge(d) {
+  const el = document.getElementById('serverBadge'); if (!el) return;
+  if (!d) { el.textContent = 'inkless-server not reachable'; el.className = 'text-xs text-red-500'; return; }
+  el.textContent = d.printer === 'online' ? (d.hold ? 'printer on hold' : 'printer ready') : 'printer offline';
+  el.className = 'text-xs ' + (d.printer === 'online' && !d.hold ? 'text-green-600' : 'text-red-500');
+}
+probeServer();
 function getServerUrl() {
+  if (serverUrl) return serverUrl;
   if (!window.INKLESS_SERVER) throw new Error('inkless-server not configured');
-  return window.INKLESS_SERVER;
+  return window.INKLESS_SERVER;  // not probed yet: try the hostname and let the error speak
 }
 
 // --- Simple generate (Haiku) ---
@@ -516,7 +535,6 @@ async function generate(prompt, mode, inputs, printLogoFirst) {
   showStatus('Generating...', 'text-teal-600', false);
   hidePreview();
   try {
-    if (printLogoFirst && !isDebug()) printLogo();  // fire-and-forget
     const res = await fetch(getServerUrl() + '/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -530,12 +548,12 @@ async function generate(prompt, mode, inputs, printLogoFirst) {
     if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error?.message || 'API error ' + res.status); }
     const data = await res.json();
     const text = data.content[0].text;
-    if (await printOrPreview(text)) {
+    if (await printOrPreview(text, printLogoFirst)) {
       saveToHistory(mode || 'Generate', inputs || {prompt}, text);
       if (!isDebug()) showStatus('Printed!', 'text-green-600');
       confetti();
     }
-    else showStatus('Print failed', 'text-red-500');
+    else printFailed();
   } catch (err) {
     if (err.message === 'inkless-server not configured' || err.message === 'Failed to fetch')
       showStatus('AI unavailable - inkless-server not reachable', 'text-red-500');
@@ -619,9 +637,6 @@ async function generateHarvest() {
   prompt += 'Keep it to 32 chars per line max. Be warm, playful, concrete. No markdown. Just the recipe, nothing else.';
 
   try {
-    // Fire logo print and AI generation in parallel
-    if (!isDebug()) printLogo();  // fire-and-forget, prints while AI generates
-
     const res = await fetch(getServerUrl() + '/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -645,20 +660,13 @@ async function generateHarvest() {
 
     const fullReceipt = header + recipe + footer;
 
-    if (await printOrPreview(fullReceipt)) {
-      if (!isDebug()) {
-        await fetch('/print/qrcode', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({data: 'https://strebergarten.studio', size: 4})
-        });
-        showStatus('Printed!', 'text-green-600');
-      }
+    if (await printOrPreview(fullReceipt, true, 'https://strebergarten.studio')) {
+      if (!isDebug()) showStatus('Printed!', 'text-green-600');
       saveToHistory('Harvest', {input: text}, fullReceipt);
       confetti();
       input.value = '';
     } else {
-      showStatus('Print failed', 'text-red-500');
+      printFailed();
     }
   } catch (err) {
     if (err.message === 'inkless-server not configured' || err.message === 'Failed to fetch')
@@ -742,12 +750,12 @@ async function generateWithSearch(inputId, systemPrompt, statusColor, statusSear
     }
 
     showStatus(isDebug() ? 'Preview ready' : 'Printing...', statusColor, false);
-    if (await printOrPreview(fullText)) {
+    if (await printOrPreview(fullText, true)) {
       saveToHistory(mode, {name}, fullText);
       if (!isDebug()) showStatus('Printed!', 'text-green-600');
       confetti(); input.value = '';
     }
-    else showStatus('Print failed', 'text-red-500');
+    else printFailed();
   } catch (err) {
     if (err.message === 'inkless-server not configured' || err.message === 'Failed to fetch')
       showStatus('AI unavailable - inkless-server not reachable', 'text-red-500');

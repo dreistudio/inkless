@@ -55,23 +55,27 @@ On success the printer prints a startup receipt with its IP address.
 
 ### 3. AI features (optional)
 
-The AI modes require **inkless-server**, a lightweight proxy that holds your Anthropic API key:
+The AI modes require **inkless-server**, a small proxy that holds your Anthropic API key. It does not talk
+to the printer itself: every slip goes to a print gateway (any HTTP endpoint that accepts
+`POST /v1/print {"text", "logo", "qr"}` with a bearer token — ours sits on a Raspberry Pi next to the printer
+and adds caps, a hold switch and a log).
 
 ```bash
 cd inkless-server
 cp .env.example .env
-# Edit .env — add your ANTHROPIC_API_KEY
+# Edit .env — ANTHROPIC_API_KEY, INKLESS_GATEWAY_URL, INKLESS_TOKEN
 pip install -e .
-python -m uvicorn server:app --host 0.0.0.0 --port 8100
+python server.py
 ```
 
-Then add the server URL to `secrets.h`:
+Then point the web page at it in `secrets.h` (hostname first, IP fallback for browsers without mDNS):
 
 ```cpp
-#define INKLESS_SERVER_URL "http://YOUR_IP:8100"
+#define INKLESS_SERVER_URL          "http://your-host.local:8100"
+#define INKLESS_SERVER_URL_FALLBACK "http://192.168.1.10:8100"
 ```
 
-Without inkless-server, all direct print features still work — only AI generation is unavailable.
+Without inkless-server, the printer's own HTTP API and the debug panel still work — only the themed modes are unavailable.
 
 ### 4. CLI (optional)
 

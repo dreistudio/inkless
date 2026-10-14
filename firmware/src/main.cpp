@@ -20,8 +20,8 @@ void setup() {
     Serial.println("\n[receipt-printer] Starting...");
 
     // Init printer on Serial2
-    Serial2.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
-    printer.begin(Serial2);
+    PRINTER_UART.begin(PRINTER_BAUD, SERIAL_8N1, PRINTER_RX_PIN, PRINTER_TX_PIN);
+    printer.begin(PRINTER_UART);
 
     // Connect WiFi (try primary, then fallback)
     WiFi.mode(WIFI_STA);

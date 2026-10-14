@@ -65,7 +65,7 @@ void setupRoutes(AsyncWebServer &server, EscPosWriter *printer) {
     // --- GET / : Web UI ---
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("text/html");
-        response->printf("<script>window.INKLESS_SERVER='%s';</script>", INKLESS_SERVER_URL);
+        response->printf("<script>window.INKLESS_SERVER='%s';window.INKLESS_SERVER_FALLBACK='%s';</script>", INKLESS_SERVER_URL, INKLESS_SERVER_URL_FALLBACK);
         response->print(FPSTR(WEB_UI_HTML));
         request->send(response);
     });

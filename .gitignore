@@ -30,3 +30,10 @@ Thumbs.db
 
 # Reachy integration (lives in reachy-host repo)
 reachy/
+
+# inkless-gateway state (hold switch, print log)
+inkless-server/state/
+
+# home box design env (enclosure-home/ itself is uncommitted until decided)
+enclosure-home/venv/
+enclosure-home/__pycache__/
